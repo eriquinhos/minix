@@ -36,9 +36,21 @@
  *===========================================================================*/
 int do_exec(void)
 {
-	message m;
+    message m;
+    char name_buffer[PATH_MAX]; /* Buffer para armazenar o nome do executável */
 
-	printf("Executando: %s\n", m_in.m_lc_pm_exec.name);
+    /* Copiar o nome do programa do espaço do usuário para o buffer local */
+    if (sys_datacopy(who_e, (vir_bytes)m_in.m_lc_pm_exec.name,
+                     SELF, (vir_bytes)name_buffer, PATH_MAX) != OK) {
+        printf("Erro ao copiar o nome do programa.\n");
+        return EFAULT; /* Retorna erro caso a cópia falhe */
+    }
+
+    /* Garantir que o buffer termina com '\0' para evitar problemas */
+    name_buffer[PATH_MAX - 1] = '\0';
+
+    /* Imprimir o nome do programa que será executado */
+    printf("Executando: %s\n", name_buffer);
 	
 	/* Forward call to VFS */
 	memset(&m, 0, sizeof(m));
