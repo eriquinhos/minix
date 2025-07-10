@@ -48,7 +48,7 @@ int do_exec(void)
 	m.VFS_PM_FRAME_LEN = m_in.m_lc_pm_exec.framelen;
 	m.VFS_PM_PS_STR = m_in.m_lc_pm_exec.ps_str;
 
-	printf("Executando: %s\n", (char *)m_in.m_lc_pm_exec.name);
+	//printf("Executando: %s\n", (char *)m_in.m_lc_pm_exec.name);
 	
 	tell_vfs(mp, &m);
 
