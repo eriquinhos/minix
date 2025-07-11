@@ -1,4 +1,4 @@
-/* This file contains the scheduling policy for SCHED
+/* This file contains the scheduling policy for SCHED - Guaranteed Scheduling
  *
  * The entry points are:
  *   do_noquantum:        Called on behalf of process' that run out of quantum
@@ -48,10 +48,10 @@ static clock_t get_monotonic(void);
 
 static unsigned cpu_proc[CONFIG_MAX_CPUS];
 
-/* SRTN specific constants */
-#define DEFAULT_BURST_ESTIMATE 100  /* Default CPU burst estimate in ms */
-#define ALPHA_NUMERATOR 1          /* For exponential averaging: alpha = 1/2 */
-#define ALPHA_DENOMINATOR 2
+/* Guaranteed Scheduling specific constants */
+#define DEFAULT_CPU_SHARE 1.0      /* Default CPU share (equal for all processes) */
+#define MIN_QUANTUM_MS 10          /* Minimum quantum in milliseconds */
+#define MAX_QUANTUM_MS 500         /* Maximum quantum in milliseconds */
 
 static void pick_cpu(struct schedproc * proc)
 {
@@ -89,22 +89,38 @@ static void pick_cpu(struct schedproc * proc)
 }
 
 /*===========================================================================*
- *				update_burst_estimate			     *
+ *				calculate_fairness_ratio		     *
  *===========================================================================*/
-static void update_burst_estimate(struct schedproc *rmp, unsigned actual_time)
+static double calculate_fairness_ratio(struct schedproc *rmp)
 {
-	/* Update CPU burst estimate using exponential averaging:
-	 * new_estimate = alpha * actual_time + (1 - alpha) * old_estimate
-	 * Using alpha = 1/2 for simplicity
+	/* Calculate fairness ratio for guaranteed scheduling:
+	 * ratio = (actual_cpu_time / total_time) / cpu_share
+	 * Lower ratio means process deserves more CPU time
 	 */
-	rmp->burst_estimate = (ALPHA_NUMERATOR * actual_time + 
-	                      (ALPHA_DENOMINATOR - ALPHA_NUMERATOR) * rmp->burst_estimate) 
-	                      / ALPHA_DENOMINATOR;
+	clock_t current_time = get_monotonic();
+	clock_t total_time = current_time - rmp->start_time;
 	
-	/* Ensure minimum estimate */
-	if (rmp->burst_estimate < 10) {
-		rmp->burst_estimate = 10;
+	if (total_time <= 0 || rmp->cpu_share <= 0.0) {
+		return 1.0; /* Default ratio */
 	}
+	
+	double actual_ratio = (double)rmp->cpu_time_used / (double)total_time;
+	double fairness_ratio = actual_ratio / rmp->cpu_share;
+	
+	return fairness_ratio;
+}
+
+/*===========================================================================*
+ *				update_cpu_usage			     *
+ *===========================================================================*/
+static void update_cpu_usage(struct schedproc *rmp, unsigned time_used)
+{
+	/* Update CPU usage statistics for guaranteed scheduling */
+	rmp->cpu_time_used += time_used;
+	rmp->total_quanta++;
+	
+	/* Update fairness ratio */
+	rmp->fairness_ratio = calculate_fairness_ratio(rmp);
 }
 
 /*===========================================================================*
@@ -114,7 +130,7 @@ int do_noquantum(message *m_ptr)
 {
 	register struct schedproc *rmp;
 	int rv, proc_nr_n;
-	unsigned actual_cpu_time;
+	unsigned quantum_used;
 
 	if (sched_isokendpt(m_ptr->m_source, &proc_nr_n) != OK) {
 		printf("SCHED: WARNING: got an invalid endpoint in OOQ msg %u.\n",
@@ -124,24 +140,29 @@ int do_noquantum(message *m_ptr)
 
 	rmp = &schedproc[proc_nr_n];
 	
-	/* Calculate actual CPU time used (quantum - remaining time) */
-	actual_cpu_time = rmp->time_slice - rmp->remaining_time;
+	/* Calculate how much of the quantum was actually used */
+	quantum_used = rmp->time_slice; /* Assume full quantum was used */
 	
-	/* Update burst estimate based on actual usage */
-	update_burst_estimate(rmp, actual_cpu_time);
+	/* Update CPU usage statistics */
+	update_cpu_usage(rmp, quantum_used);
 	
-	/* For SRTN, we need to update the remaining time estimate */
-	if (rmp->remaining_time > actual_cpu_time) {
-		rmp->remaining_time -= actual_cpu_time;
+	/* For Guaranteed Scheduling, adjust quantum based on fairness */
+	/* Processes with lower fairness ratio get larger quantum */
+	if (rmp->fairness_ratio < 1.0) {
+		/* Process is behind, give it more time */
+		rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE * (2.0 - rmp->fairness_ratio));
+		if (rmp->time_slice > MAX_QUANTUM_MS) {
+			rmp->time_slice = MAX_QUANTUM_MS;
+		}
 	} else {
-		/* Process completed its burst, reset with new estimate */
-		rmp->remaining_time = rmp->burst_estimate;
+		/* Process is ahead or on schedule, give normal or reduced time */
+		rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
+		if (rmp->time_slice < MIN_QUANTUM_MS) {
+			rmp->time_slice = MIN_QUANTUM_MS;
+		}
 	}
 	
-	/* Reset time slice for next quantum */
-	rmp->time_slice = DEFAULT_USER_TIME_SLICE;
-	
-	/* Don't change priority for SRTN - kernel will handle ordering by remaining time */
+	/* Don't change priority - guaranteed scheduling uses fairness ordering in kernel */
 	if ((rv = schedule_process_local(rmp)) != OK) {
 		return rv;
 	}
@@ -207,10 +228,12 @@ int do_start_scheduling(message *m_ptr)
 		return EINVAL;
 	}
 
-	/* Initialize SRTN specific fields */
-	rmp->burst_estimate = DEFAULT_BURST_ESTIMATE;
-	rmp->remaining_time = DEFAULT_BURST_ESTIMATE;
-	rmp->last_scheduled = 0;
+	/* Initialize Guaranteed Scheduling specific fields */
+	rmp->cpu_share = DEFAULT_CPU_SHARE;
+	rmp->cpu_time_used = 0;
+	rmp->start_time = get_monotonic();
+	rmp->fairness_ratio = 1.0;
+	rmp->total_quanta = 0;
 
 	/* Inherit current priority and time slice from parent. Since there
 	 * is currently only one scheduler scheduling the whole system, this
@@ -254,9 +277,8 @@ int do_start_scheduling(message *m_ptr)
 		rmp->priority = schedproc[parent_nr_n].priority;
 		rmp->time_slice = schedproc[parent_nr_n].time_slice;
 		
-		/* Inherit SRTN estimates from parent */
-		rmp->burst_estimate = schedproc[parent_nr_n].burst_estimate;
-		rmp->remaining_time = schedproc[parent_nr_n].remaining_time;
+		/* Inherit Guaranteed Scheduling parameters from parent */
+		rmp->cpu_share = schedproc[parent_nr_n].cpu_share;
 		break;
 		
 	default: 
@@ -331,12 +353,20 @@ int do_nice(message *m_ptr)
 
 	/* Update the proc entry and reschedule the process */
 	rmp->max_priority = rmp->priority = new_q;
+	
+	/* Adjust CPU share based on nice level for guaranteed scheduling */
+	/* Higher priority (lower number) gets more CPU share */
+	rmp->cpu_share = DEFAULT_CPU_SHARE * (NR_SCHED_QUEUES - new_q) / NR_SCHED_QUEUES;
+	if (rmp->cpu_share < 0.1) {
+		rmp->cpu_share = 0.1; /* Minimum share */
+	}
 
 	if ((rv = schedule_process_local(rmp)) != OK) {
 		/* Something went wrong when rescheduling the process, roll
 		 * back the changes to proc struct */
 		rmp->priority     = old_q;
 		rmp->max_priority = old_max_q;
+		rmp->cpu_share = DEFAULT_CPU_SHARE;
 	}
 
 	return rv;
@@ -358,9 +388,8 @@ static int schedule_process(struct schedproc * rmp, unsigned flags)
 		new_prio = -1;
 
 	if (flags & SCHEDULE_CHANGE_QUANTUM) {
-		/* For SRTN, quantum should be based on remaining time estimate */
-		new_quantum = (rmp->remaining_time < rmp->time_slice) ? 
-		              rmp->remaining_time : rmp->time_slice;
+		/* For Guaranteed Scheduling, quantum is dynamically adjusted */
+		new_quantum = rmp->time_slice;
 	} else {
 		new_quantum = -1;
 	}
@@ -399,7 +428,7 @@ void init_scheduling(void)
  *===========================================================================*/
 
 /* This function is called every N ticks to rebalance the queues. 
- * For SRTN, we update burst estimates and remaining times periodically.
+ * For Guaranteed Scheduling, we update fairness ratios and adjust CPU shares.
  */
 void balance_queues(void)
 {
@@ -409,19 +438,27 @@ void balance_queues(void)
 
 	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
 		if (rmp->flags & IN_USE) {
-			/* Update remaining time based on elapsed time since last scheduling */
-			if (rmp->last_scheduled > 0) {
-				clock_t elapsed = current_time - rmp->last_scheduled;
-				if (rmp->remaining_time > elapsed) {
-					rmp->remaining_time -= elapsed;
-				} else {
-					/* Process likely completed its burst, reset estimate */
-					rmp->remaining_time = rmp->burst_estimate;
+			/* Update fairness ratio */
+			rmp->fairness_ratio = calculate_fairness_ratio(rmp);
+			
+			/* Adjust time slice based on fairness */
+			if (rmp->fairness_ratio < 0.5) {
+				/* Process is significantly behind, boost it */
+				rmp->time_slice = MAX_QUANTUM_MS;
+			} else if (rmp->fairness_ratio > 2.0) {
+				/* Process is significantly ahead, reduce it */
+				rmp->time_slice = MIN_QUANTUM_MS;
+			} else {
+				/* Normal adjustment */
+				rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
+				if (rmp->time_slice < MIN_QUANTUM_MS) {
+					rmp->time_slice = MIN_QUANTUM_MS;
+				} else if (rmp->time_slice > MAX_QUANTUM_MS) {
+					rmp->time_slice = MAX_QUANTUM_MS;
 				}
 			}
-			rmp->last_scheduled = current_time;
 			
-			/* Reschedule to update kernel with new remaining time */
+			/* Reschedule to update kernel with new quantum */
 			schedule_process_local(rmp);
 		}
 	}
