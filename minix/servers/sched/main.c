@@ -134,4 +134,3 @@ static int sef_cb_init_fresh(int UNUSED(type), sef_init_info_t *UNUSED(info))
 
 	return(OK);
 }
-
