@@ -131,6 +131,13 @@ struct proc {
    */
   struct { reg_t r1, r2, r3; } p_defer;
 
+  /* SRTN specific fields - added for kernel-level SRTN support */
+  u64_t p_burst_estimate;	/* estimated CPU burst time in cycles */
+  u64_t p_remaining_estimate;	/* estimated remaining time in cycles */
+  u64_t p_last_burst_start;	/* when current burst started */
+  u64_t p_total_burst_time;	/* total time spent in CPU bursts */
+  unsigned p_burst_count;	/* number of completed bursts */
+
 #if DEBUG_TRACE
   int p_schedules;
 #endif
