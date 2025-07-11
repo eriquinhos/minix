@@ -34,12 +34,13 @@ EXTERN struct schedproc {
 								process allowed
 								to run on */
 	
-	/* SRTN specific fields */
-	unsigned burst_estimate;	/* estimated CPU burst time in ms */
-	unsigned remaining_time;	/* estimated remaining CPU time in ms */
-	clock_t last_scheduled;		/* timestamp of last scheduling */
-	unsigned total_cpu_time;	/* total CPU time used by process */
-	unsigned burst_count;		/* number of CPU bursts completed */
+	/* Guaranteed Scheduling specific fields */
+	double cpu_share;		/* guaranteed CPU share (0.0 to 1.0) */
+	clock_t cpu_time_used;		/* total CPU time used by process */
+	clock_t start_time;		/* when process started */
+	double fairness_ratio;		/* current fairness ratio */
+	unsigned total_quanta;		/* total number of quanta received */
+	clock_t last_update;		/* last time statistics were updated */
 } schedproc[NR_PROCS];
 
 /* Flag values */
