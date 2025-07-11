@@ -33,6 +33,13 @@ EXTERN struct schedproc {
 	bitchunk_t cpu_mask[BITMAP_CHUNKS(CONFIG_MAX_CPUS)]; /* what CPUs is the
 								process allowed
 								to run on */
+	
+	/* SRTN specific fields */
+	unsigned burst_estimate;	/* estimated CPU burst time in ms */
+	unsigned remaining_time;	/* estimated remaining CPU time in ms */
+	clock_t last_scheduled;		/* timestamp of last scheduling */
+	unsigned total_cpu_time;	/* total CPU time used by process */
+	unsigned burst_count;		/* number of CPU bursts completed */
 } schedproc[NR_PROCS];
 
 /* Flag values */
