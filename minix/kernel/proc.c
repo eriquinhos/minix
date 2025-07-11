@@ -136,6 +136,9 @@ void proc_init(void)
 		rp->p_priority = 0;						 /* no priority */
 		rp->p_quantum_size_ms = 0;				 /* no quantum size */
 
+		/* FIXED: Initialize justica field to prevent uninitialized values */
+		rp->justica = 1.0;
+
 		/* arch-specific initialization */
 		arch_proc_reset(rp);
 	}
@@ -1740,7 +1743,23 @@ void enqueue(
 	}
 	else
 	{
-		rp->justica = rp->p_accounting.time_in_queue / (rp->p_cpu_time_left * rp->p_quantum_size_ms);
+		/* FIXED: Calculate justica with proper safety checks to prevent division by zero */
+		u64_t denominator = (u64_t)rp->p_cpu_time_left * (u64_t)rp->p_quantum_size_ms;
+		
+		if (denominator > 0 && rp->p_accounting.time_in_queue > 0) {
+			rp->justica = (double)rp->p_accounting.time_in_queue / (double)denominator;
+		} else {
+			/* Default value when calculation is not possible */
+			rp->justica = 1.0;
+		}
+		
+		/* Ensure justica is within reasonable bounds */
+		if (rp->justica < 0.0) {
+			rp->justica = 0.0;
+		} else if (rp->justica > 1000.0) {
+			rp->justica = 1000.0;
+		}
+		
 		struct proc *atual = rdy_head[q];
 		struct proc *anterior = NULL;
 
