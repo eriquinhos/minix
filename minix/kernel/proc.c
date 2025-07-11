@@ -33,6 +33,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <string.h>
+
 #include "vm.h"
 #include "clock.h"
 #include "spinlock.h"
@@ -1726,7 +1727,6 @@ void enqueue(
 	struct proc **rdy_head, **rdy_tail;
 
 	assert(proc_is_runnable(rp));
-
 	assert(q >= 0);
 
 	rdy_head = get_cpu_var(rp->p_cpu, run_q_head);
@@ -1740,33 +1740,25 @@ void enqueue(
 	}
 	else
 	{
+		rp->justica = rp->p_accounting.time_in_queue / (rp->p_cpu_time_left * rp->p_quantum_size_ms);
 		struct proc *atual = rdy_head[q];
-		struct proc *ant = NULL;
+		struct proc *anterior = NULL;
 
-		while (atual != NULL)
+		while (atual != NULL && rp->justica > atual->justica)
 		{
-			if (rp->p_cpu_time_left < atual->p_cpu_time_left)
-			{
-				if (atual != rdy_head[q])
-				{
-					ant->p_nextready = rp;
-					rp->p_nextready = atual;
-				}
-				else
-				{
-					rp->p_nextready = rdy_head[q];
-					rdy_head[q] = rp;
-				}
-				break;
-			}
-			ant = atual;
+			anterior = atual;
 			atual = atual->p_nextready;
 		}
-		if (atual == NULL)
+
+		if (anterior == NULL)
 		{
-			rdy_tail[q]->p_nextready = rp; /* chain tail of queue */
-			rdy_tail[q] = rp;			   /* set new queue tail */
-			rp->p_nextready = NULL;		   /* mark new end */
+			rp->p_nextready = rdy_head[q];
+			rdy_head[q] = rp;
+		}
+		else
+		{
+			anterior->p_nextready = rp;
+			rp->p_nextready = atual;
 		}
 	}
 
