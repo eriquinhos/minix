@@ -12,12 +12,15 @@
 #include <assert.h>
 #include <minix/com.h>
 #include <machine/archtypes.h>
+#include <minix/sysutil.h>
+#include <minix/timers.h>
 
 static unsigned balance_timeout;
 
 #define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
 
 static int schedule_process(struct schedproc * rmp, unsigned flags);
+static clock_t get_monotonic(void);
 
 #define SCHEDULE_CHANGE_PRIO	0x1
 #define SCHEDULE_CHANGE_QUANTUM	0x2
@@ -425,4 +428,13 @@ void balance_queues(void)
 
 	if ((r = sys_setalarm(balance_timeout, 0)) != OK)
 		panic("sys_setalarm failed: %d", r);
+}
+
+static clock_t get_monotonic(void)
+{
+	clock_t uptime;
+	if (sys_times(NONE, &uptime, NULL, NULL, NULL) != OK) {
+		uptime = 0;
+	}
+	return uptime;
 }
