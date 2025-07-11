@@ -52,6 +52,7 @@ static unsigned cpu_proc[CONFIG_MAX_CPUS];
 #define DEFAULT_CPU_SHARE 1.0      /* Default CPU share (equal for all processes) */
 #define MIN_QUANTUM_MS 10          /* Minimum quantum in milliseconds */
 #define MAX_QUANTUM_MS 500         /* Maximum quantum in milliseconds */
+#define MIN_TIME_THRESHOLD 1       /* Minimum time threshold to avoid division by zero */
 
 static void pick_cpu(struct schedproc * proc)
 {
@@ -100,12 +101,25 @@ static double calculate_fairness_ratio(struct schedproc *rmp)
 	clock_t current_time = get_monotonic();
 	clock_t total_time = current_time - rmp->start_time;
 	
-	if (total_time <= 0 || rmp->cpu_share <= 0.0) {
+	/* FIXED: Add safety checks to prevent division by zero */
+	if (total_time <= MIN_TIME_THRESHOLD || rmp->cpu_share <= 0.0) {
 		return 1.0; /* Default ratio */
+	}
+	
+	/* FIXED: Additional check for cpu_time_used */
+	if (rmp->cpu_time_used <= 0) {
+		return 0.1; /* Process hasn't used much CPU, give it priority */
 	}
 	
 	double actual_ratio = (double)rmp->cpu_time_used / (double)total_time;
 	double fairness_ratio = actual_ratio / rmp->cpu_share;
+	
+	/* FIXED: Ensure fairness_ratio is within reasonable bounds */
+	if (fairness_ratio < 0.01) {
+		fairness_ratio = 0.01;
+	} else if (fairness_ratio > 100.0) {
+		fairness_ratio = 100.0;
+	}
 	
 	return fairness_ratio;
 }
@@ -146,20 +160,30 @@ int do_noquantum(message *m_ptr)
 	/* Update CPU usage statistics */
 	update_cpu_usage(rmp, quantum_used);
 	
+	/* FIXED: Add safety checks before division operations */
 	/* For Guaranteed Scheduling, adjust quantum based on fairness */
 	/* Processes with lower fairness ratio get larger quantum */
-	if (rmp->fairness_ratio < 1.0) {
+	if (rmp->fairness_ratio < 1.0 && rmp->fairness_ratio > 0.0) {
 		/* Process is behind, give it more time */
 		rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE * (2.0 - rmp->fairness_ratio));
 		if (rmp->time_slice > MAX_QUANTUM_MS) {
 			rmp->time_slice = MAX_QUANTUM_MS;
 		}
-	} else {
+	} else if (rmp->fairness_ratio >= 1.0) {
 		/* Process is ahead or on schedule, give normal or reduced time */
-		rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
+		/* FIXED: Ensure fairness_ratio is not zero before division */
+		if (rmp->fairness_ratio > 0.01) {
+			rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
+		} else {
+			rmp->time_slice = DEFAULT_USER_TIME_SLICE;
+		}
+		
 		if (rmp->time_slice < MIN_QUANTUM_MS) {
 			rmp->time_slice = MIN_QUANTUM_MS;
 		}
+	} else {
+		/* Fallback case */
+		rmp->time_slice = DEFAULT_USER_TIME_SLICE;
 	}
 	
 	/* Don't change priority - guaranteed scheduling uses fairness ordering in kernel */
@@ -183,7 +207,7 @@ int do_stop_scheduling(message *m_ptr)
 
 	if (sched_isokendpt(m_ptr->m_lsys_sched_scheduling_stop.endpoint,
 		    &proc_nr_n) != OK) {
-		printf("SCHED: WARNING: got an invalid endpoint in OOQ msg "
+		printf("SCHED: WARNING: got an invalid endpoint in OoQ msg "
 		"%d\n", m_ptr->m_lsys_sched_scheduling_stop.endpoint);
 		return EBADEPT;
 	}
@@ -228,10 +252,14 @@ int do_start_scheduling(message *m_ptr)
 		return EINVAL;
 	}
 
-	/* Initialize Guaranteed Scheduling specific fields */
+	/* FIXED: Initialize Guaranteed Scheduling specific fields with safe values */
 	rmp->cpu_share = DEFAULT_CPU_SHARE;
 	rmp->cpu_time_used = 0;
 	rmp->start_time = get_monotonic();
+	/* FIXED: Ensure start_time is valid */
+	if (rmp->start_time <= 0) {
+		rmp->start_time = 1; /* Minimum valid time */
+	}
 	rmp->fairness_ratio = 1.0;
 	rmp->total_quanta = 0;
 
@@ -264,6 +292,12 @@ int do_start_scheduling(message *m_ptr)
 		 * from the parent */
 		rmp->priority   = rmp->max_priority;
 		rmp->time_slice = m_ptr->m_lsys_sched_scheduling_start.quantum;
+		/* FIXED: Ensure quantum is within valid range */
+		if (rmp->time_slice < MIN_QUANTUM_MS) {
+			rmp->time_slice = MIN_QUANTUM_MS;
+		} else if (rmp->time_slice > MAX_QUANTUM_MS) {
+			rmp->time_slice = MAX_QUANTUM_MS;
+		}
 		break;
 		
 	case SCHEDULING_INHERIT:
@@ -277,8 +311,19 @@ int do_start_scheduling(message *m_ptr)
 		rmp->priority = schedproc[parent_nr_n].priority;
 		rmp->time_slice = schedproc[parent_nr_n].time_slice;
 		
+		/* FIXED: Ensure inherited values are valid */
+		if (rmp->time_slice < MIN_QUANTUM_MS) {
+			rmp->time_slice = MIN_QUANTUM_MS;
+		} else if (rmp->time_slice > MAX_QUANTUM_MS) {
+			rmp->time_slice = MAX_QUANTUM_MS;
+		}
+		
 		/* Inherit Guaranteed Scheduling parameters from parent */
 		rmp->cpu_share = schedproc[parent_nr_n].cpu_share;
+		/* FIXED: Ensure cpu_share is valid */
+		if (rmp->cpu_share <= 0.0) {
+			rmp->cpu_share = DEFAULT_CPU_SHARE;
+		}
 		break;
 		
 	default: 
@@ -354,11 +399,15 @@ int do_nice(message *m_ptr)
 	/* Update the proc entry and reschedule the process */
 	rmp->max_priority = rmp->priority = new_q;
 	
-	/* Adjust CPU share based on nice level for guaranteed scheduling */
+	/* FIXED: Adjust CPU share based on nice level for guaranteed scheduling */
 	/* Higher priority (lower number) gets more CPU share */
-	rmp->cpu_share = DEFAULT_CPU_SHARE * (NR_SCHED_QUEUES - new_q) / NR_SCHED_QUEUES;
-	if (rmp->cpu_share < 0.1) {
-		rmp->cpu_share = 0.1; /* Minimum share */
+	if (NR_SCHED_QUEUES > 0) {
+		rmp->cpu_share = DEFAULT_CPU_SHARE * (NR_SCHED_QUEUES - new_q) / NR_SCHED_QUEUES;
+		if (rmp->cpu_share < 0.1) {
+			rmp->cpu_share = 0.1; /* Minimum share */
+		}
+	} else {
+		rmp->cpu_share = DEFAULT_CPU_SHARE;
 	}
 
 	if ((rv = schedule_process_local(rmp)) != OK) {
@@ -390,6 +439,12 @@ static int schedule_process(struct schedproc * rmp, unsigned flags)
 	if (flags & SCHEDULE_CHANGE_QUANTUM) {
 		/* For Guaranteed Scheduling, quantum is dynamically adjusted */
 		new_quantum = rmp->time_slice;
+		/* FIXED: Ensure quantum is within valid bounds */
+		if (new_quantum < MIN_QUANTUM_MS) {
+			new_quantum = MIN_QUANTUM_MS;
+		} else if (new_quantum > MAX_QUANTUM_MS) {
+			new_quantum = MAX_QUANTUM_MS;
+		}
 	} else {
 		new_quantum = -1;
 	}
@@ -441,21 +496,24 @@ void balance_queues(void)
 			/* Update fairness ratio */
 			rmp->fairness_ratio = calculate_fairness_ratio(rmp);
 			
-			/* Adjust time slice based on fairness */
-			if (rmp->fairness_ratio < 0.5) {
+			/* FIXED: Adjust time slice based on fairness with safety checks */
+			if (rmp->fairness_ratio < 0.5 && rmp->fairness_ratio > 0.0) {
 				/* Process is significantly behind, boost it */
 				rmp->time_slice = MAX_QUANTUM_MS;
 			} else if (rmp->fairness_ratio > 2.0) {
 				/* Process is significantly ahead, reduce it */
 				rmp->time_slice = MIN_QUANTUM_MS;
-			} else {
-				/* Normal adjustment */
+			} else if (rmp->fairness_ratio > 0.01) {
+				/* Normal adjustment with division safety check */
 				rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
 				if (rmp->time_slice < MIN_QUANTUM_MS) {
 					rmp->time_slice = MIN_QUANTUM_MS;
 				} else if (rmp->time_slice > MAX_QUANTUM_MS) {
 					rmp->time_slice = MAX_QUANTUM_MS;
 				}
+			} else {
+				/* Fallback for invalid fairness_ratio */
+				rmp->time_slice = DEFAULT_USER_TIME_SLICE;
 			}
 			
 			/* Reschedule to update kernel with new quantum */
@@ -471,7 +529,7 @@ static clock_t get_monotonic(void)
 {
 	clock_t uptime;
 	if (sys_times(NONE, &uptime, NULL, NULL, NULL) != OK) {
-		uptime = 0;
+		uptime = 1; /* FIXED: Return 1 instead of 0 to avoid division by zero */
 	}
-	return uptime;
+	return uptime > 0 ? uptime : 1; /* FIXED: Ensure positive return value */
 }
