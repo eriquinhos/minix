@@ -1,0 +1,10 @@
+IO	 6	 8.6
+CPU	 9	 0
+IO	 8	 5
+CPU	 1	 0
+IO	 2	 3.55
+CPU	 3	 0
+IO	 0	 8.55
+CPU	 5	 0
+IO	 4	 8.55
+CPU	 7	 0
