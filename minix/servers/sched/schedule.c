@@ -45,6 +45,11 @@ static int schedule_process(struct schedproc * rmp, unsigned flags);
 
 static unsigned cpu_proc[CONFIG_MAX_CPUS];
 
+/* SRTN specific constants */
+#define DEFAULT_BURST_ESTIMATE 100  /* Default CPU burst estimate in ms */
+#define ALPHA_NUMERATOR 1          /* For exponential averaging: alpha = 1/2 */
+#define ALPHA_DENOMINATOR 2
+
 static void pick_cpu(struct schedproc * proc)
 {
 #ifdef CONFIG_SMP
@@ -81,13 +86,32 @@ static void pick_cpu(struct schedproc * proc)
 }
 
 /*===========================================================================*
+ *				update_burst_estimate			     *
+ *===========================================================================*/
+static void update_burst_estimate(struct schedproc *rmp, unsigned actual_time)
+{
+	/* Update CPU burst estimate using exponential averaging:
+	 * new_estimate = alpha * actual_time + (1 - alpha) * old_estimate
+	 * Using alpha = 1/2 for simplicity
+	 */
+	rmp->burst_estimate = (ALPHA_NUMERATOR * actual_time + 
+	                      (ALPHA_DENOMINATOR - ALPHA_NUMERATOR) * rmp->burst_estimate) 
+	                      / ALPHA_DENOMINATOR;
+	
+	/* Ensure minimum estimate */
+	if (rmp->burst_estimate < 10) {
+		rmp->burst_estimate = 10;
+	}
+}
+
+/*===========================================================================*
  *				do_noquantum				     *
  *===========================================================================*/
-
 int do_noquantum(message *m_ptr)
 {
 	register struct schedproc *rmp;
 	int rv, proc_nr_n;
+	unsigned actual_cpu_time;
 
 	if (sched_isokendpt(m_ptr->m_source, &proc_nr_n) != OK) {
 		printf("SCHED: WARNING: got an invalid endpoint in OOQ msg %u.\n",
@@ -96,10 +120,25 @@ int do_noquantum(message *m_ptr)
 	}
 
 	rmp = &schedproc[proc_nr_n];
-	if (rmp->priority < MIN_USER_Q) {
-		rmp->priority += 1; /* lower priority */
+	
+	/* Calculate actual CPU time used (quantum - remaining time) */
+	actual_cpu_time = rmp->time_slice - rmp->remaining_time;
+	
+	/* Update burst estimate based on actual usage */
+	update_burst_estimate(rmp, actual_cpu_time);
+	
+	/* For SRTN, we need to update the remaining time estimate */
+	if (rmp->remaining_time > actual_cpu_time) {
+		rmp->remaining_time -= actual_cpu_time;
+	} else {
+		/* Process completed its burst, reset with new estimate */
+		rmp->remaining_time = rmp->burst_estimate;
 	}
-
+	
+	/* Reset time slice for next quantum */
+	rmp->time_slice = DEFAULT_USER_TIME_SLICE;
+	
+	/* Don't change priority for SRTN - kernel will handle ordering by remaining time */
 	if ((rv = schedule_process_local(rmp)) != OK) {
 		return rv;
 	}
@@ -165,6 +204,11 @@ int do_start_scheduling(message *m_ptr)
 		return EINVAL;
 	}
 
+	/* Initialize SRTN specific fields */
+	rmp->burst_estimate = DEFAULT_BURST_ESTIMATE;
+	rmp->remaining_time = DEFAULT_BURST_ESTIMATE;
+	rmp->last_scheduled = 0;
+
 	/* Inherit current priority and time slice from parent. Since there
 	 * is currently only one scheduler scheduling the whole system, this
 	 * value is local and we assert that the parent endpoint is valid */
@@ -206,6 +250,10 @@ int do_start_scheduling(message *m_ptr)
 
 		rmp->priority = schedproc[parent_nr_n].priority;
 		rmp->time_slice = schedproc[parent_nr_n].time_slice;
+		
+		/* Inherit SRTN estimates from parent */
+		rmp->burst_estimate = schedproc[parent_nr_n].burst_estimate;
+		rmp->remaining_time = schedproc[parent_nr_n].remaining_time;
 		break;
 		
 	default: 
@@ -306,10 +354,13 @@ static int schedule_process(struct schedproc * rmp, unsigned flags)
 	else
 		new_prio = -1;
 
-	if (flags & SCHEDULE_CHANGE_QUANTUM)
-		new_quantum = rmp->time_slice;
-	else
+	if (flags & SCHEDULE_CHANGE_QUANTUM) {
+		/* For SRTN, quantum should be based on remaining time estimate */
+		new_quantum = (rmp->remaining_time < rmp->time_slice) ? 
+		              rmp->remaining_time : rmp->time_slice;
+	} else {
 		new_quantum = -1;
+	}
 
 	if (flags & SCHEDULE_CHANGE_CPU)
 		new_cpu = rmp->cpu;
@@ -326,7 +377,6 @@ static int schedule_process(struct schedproc * rmp, unsigned flags)
 
 	return err;
 }
-
 
 /*===========================================================================*
  *				init_scheduling				     *
@@ -345,22 +395,31 @@ void init_scheduling(void)
  *				balance_queues				     *
  *===========================================================================*/
 
-/* This function in called every N ticks to rebalance the queues. The current
- * scheduler bumps processes down one priority when ever they run out of
- * quantum. This function will find all proccesses that have been bumped down,
- * and pulls them back up. This default policy will soon be changed.
+/* This function is called every N ticks to rebalance the queues. 
+ * For SRTN, we update burst estimates and remaining times periodically.
  */
 void balance_queues(void)
 {
 	struct schedproc *rmp;
 	int r, proc_nr;
+	clock_t current_time = get_monotonic();
 
 	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
 		if (rmp->flags & IN_USE) {
-			if (rmp->priority > rmp->max_priority) {
-				rmp->priority -= 1; /* increase priority */
-				schedule_process_local(rmp);
+			/* Update remaining time based on elapsed time since last scheduling */
+			if (rmp->last_scheduled > 0) {
+				clock_t elapsed = current_time - rmp->last_scheduled;
+				if (rmp->remaining_time > elapsed) {
+					rmp->remaining_time -= elapsed;
+				} else {
+					/* Process likely completed its burst, reset estimate */
+					rmp->remaining_time = rmp->burst_estimate;
+				}
 			}
+			rmp->last_scheduled = current_time;
+			
+			/* Reschedule to update kernel with new remaining time */
+			schedule_process_local(rmp);
 		}
 	}
 
