@@ -136,8 +136,8 @@ void proc_init(void)
 		rp->p_priority = 0;						 /* no priority */
 		rp->p_quantum_size_ms = 0;				 /* no quantum size */
 
-		/* FIXED: Initialize justica field to prevent uninitialized values */
-		rp->justica = 1.0;
+		/* FIXED: Initialize justica field as integer (scaled by 1000) */
+		rp->justica = 1000; /* 1.0 * 1000 = 1000 */
 
 		/* arch-specific initialization */
 		arch_proc_reset(rp);
@@ -1743,26 +1743,32 @@ void enqueue(
 	}
 	else
 	{
-		/* FIXED: Calculate justica with proper safety checks to prevent division by zero */
+		/* FIXED: Calculate justica using integer arithmetic (scaled by 1000) */
+		/* justica = (time_in_queue * 1000) / (cpu_time_left * quantum_size_ms) */
+		u64_t numerator = (u64_t)rp->p_accounting.time_in_queue * 1000ULL;
 		u64_t denominator = (u64_t)rp->p_cpu_time_left * (u64_t)rp->p_quantum_size_ms;
 		
 		if (denominator > 0 && rp->p_accounting.time_in_queue > 0) {
-			rp->justica = (double)rp->p_accounting.time_in_queue / (double)denominator;
+			/* Prevent overflow by checking if numerator is too large */
+			if (numerator / 1000ULL > UINT32_MAX / 1000ULL) {
+				rp->justica = 1000000; /* Very high value for overflow case */
+			} else {
+				rp->justica = (u32_t)(numerator / denominator);
+			}
 		} else {
 			/* Default value when calculation is not possible */
-			rp->justica = 1.0;
+			rp->justica = 1000; /* 1.0 * 1000 */
 		}
 		
-		/* Ensure justica is within reasonable bounds */
-		if (rp->justica < 0.0) {
-			rp->justica = 0.0;
-		} else if (rp->justica > 1000.0) {
-			rp->justica = 1000.0;
+		/* Ensure justica is within reasonable bounds (0 to 1000000) */
+		if (rp->justica > 1000000) {
+			rp->justica = 1000000;
 		}
 		
 		struct proc *atual = rdy_head[q];
 		struct proc *anterior = NULL;
 
+		/* Insert process in order of justica (lower values first) */
 		while (atual != NULL && rp->justica > atual->justica)
 		{
 			anterior = atual;
@@ -1808,7 +1814,7 @@ void enqueue(
 #endif
 
 	/* Make note of when this process was added to queue */
-	read_tsc_64(&(get_cpulocal_var(proc_ptr)->p_accounting.enter_queue));
+	read_tsc_64(&(get_cpulocal_var(proc_ptr->p_accounting.enter_queue)));
 
 #if DEBUG_SANITYCHECKS
 	assert(runqueues_ok_local());
