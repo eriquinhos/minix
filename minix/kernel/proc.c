@@ -11,22 +11,9 @@
  *   May 24, 2005     new notification system call  (Jorrit N. Herder)
  *   Oct 28, 2004     nonblocking send and receive calls  (Jorrit N. Herder)
  *
- * The code here is critical to make everything work and is important for the
- * overall performance of the system. A large fraction of the code deals with
- * list manipulation. To make this both easy to understand and fast to execute
- * pointer pointers are used throughout the code. Pointer pointers prevent
- * exceptions for the head or tail of a linked list.
- *
- *  node_t *queue, *new_node;	// assume these as global variables
- *  node_t **xpp = &queue; 	// get pointer pointer to head of queue
- *  while (*xpp != NULL) 	// find last pointer of the linked list
- *      xpp = &(*xpp)->next;	// get pointer to next pointer
- *  *xpp = new_node;		// now replace the end (the NULL pointer)
- *  new_node->next = NULL;	// and mark the new end of the list
- *
- * For example, when adding a new node to the end of the list, one normally
- * makes an exception for an empty list and looks up the end of the list for
- * nonempty lists. As shown above, this is not required with pointer pointers.
+ * LOTTERY SCHEDULER IMPLEMENTATION:
+ * Modified to implement lottery scheduling algorithm where processes
+ * receive tickets based on their priority level.
  */
 
 #include <stddef.h>
@@ -40,6 +27,21 @@
 #include "arch_proto.h"
 
 #include <minix/syslib.h>
+
+/* Random number generator for lottery scheduling */
+static unsigned long lottery_seed = 1;
+
+static int lottery_random(void)
+{
+    /* Simple linear congruential generator */
+    lottery_seed = lottery_seed * 1103515245 + 12345;
+    return (unsigned int)(lottery_seed / 65536) % 32768;
+}
+
+static void lottery_srand(unsigned int seed)
+{
+    lottery_seed = seed;
+}
 
 /* Scheduling and message passing functions */
 static void idle(void);
@@ -121,6 +123,9 @@ void proc_init(void)
     struct proc *rp;
     struct priv *sp;
     int i;
+
+    /* Initialize lottery scheduler random seed */
+    lottery_srand(get_monotonic());
 
     /* Clear the process table. Announce each slot as empty and set up
      * mappings for proc_addr() and proc_nr() macros. Do the same for the
@@ -1911,107 +1916,78 @@ void dequeue(struct proc *rp)
 static struct proc *pick_proc(void)
 {
     /* Lottery Scheduler Implementation
-     * Decide who to run now using lottery scheduling. A new process is selected
-     * and returned. When a billable process is selected, record it in 'bill_ptr',
+     * Decide who to run now using lottery scheduling. A new process is selected 
+     * and returned. When a billable process is selected, record it in 'bill_ptr', 
      * so that the clock task can tell who to bill for system time.
      *
      * This function always uses the run queues of the local cpu!
      */
-    int rdy_procs[15] = {0};
-    int tickets, chosen_ticket, tickets_number = 0;
     register struct proc *rp; /* process to run */
     struct proc **rdy_head;
     int q; /* iterate over queues */
-
-    /* Check each of the scheduling queues for ready processes. The number of
-     * queues is defined in proc.h, and priorities are set in the task table.
-     * If there are no processes ready to run, return NULL.
-     */
-
-    // Count ready processes in each queue except IDLE and store each value in rdy_procs
-    register struct proc *process = &proc[0];
-    if (!proc_is_runnable(process))
-    {
-        process = process->p_nextready;
-    }
-
-    while (process != NULL)
-    {
-        if (process->p_priority != 15)
-        { // Skip IDLE queue
-            rdy_procs[process->p_priority]++;
-        }
-        process = process->p_nextready;
-    }
-
-    // Count the maximum number of tickets
-    for (q = 0; q < NR_SCHED_QUEUES - 1; q++)
-    {
-        tickets = (NR_SCHED_QUEUES - 1 - q) * rdy_procs[q];
-        tickets_number += tickets;
-    }
-
-    // Traverse the queues looking for the queue that contains the drawn ticket
-    // and find the drawn ticket by means of sums of the number of tickets
-    // that each process receives according to its priority queue
-    int tickets_sum = 0;
-    int tickets_sum_before = 0;
-    int tickets_per_process = 0;
+    int total_tickets = 0;
+    int chosen_ticket;
+    int current_ticket = 0;
 
     rdy_head = get_cpulocal_var(run_q_head);
 
-    if (tickets_number != 0)
+    /* First pass: count total tickets from all ready processes */
+    for (q = 0; q < NR_SCHED_QUEUES; q++)
     {
-        // Draw the ticket
-        chosen_ticket = random() % tickets_number + 1;
-
-        for (q = 0; q < NR_SCHED_QUEUES - 1; q++)
+        for (rp = rdy_head[q]; rp != NULL; rp = rp->p_nextready)
         {
-            tickets_per_process = NR_SCHED_QUEUES - 1 - q;
-            tickets = (NR_SCHED_QUEUES - 1 - q) * rdy_procs[q];
-            tickets_sum_before = tickets_sum + 1;
-            tickets_sum += tickets;
-
-            if (chosen_ticket <= tickets_sum)
+            if (q == IDLE_Q)
             {
-                break;
+                /* IDLE processes get 1 ticket */
+                total_tickets += 1;
             }
-        }
-
-        int process_index = 0;
-        for (int i = 0; i < rdy_procs[q]; i++)
-        {
-            if ((chosen_ticket >= (tickets_sum_before + (i * tickets_per_process))) &&
-                (chosen_ticket < (tickets_sum_before + ((i + 1) * tickets_per_process))))
+            else
             {
-                process_index = i;
-                break;
-            }
-        }
-
-        rp = rdy_head[q];
-        for (int i = 0; i < process_index; i++)
-        {
-            if (rp != NULL)
-            {
-                rp = rp->p_nextready;
+                /* Higher priority (lower number) gets more tickets */
+                /* Priority 0 gets NR_SCHED_QUEUES tickets, priority 1 gets NR_SCHED_QUEUES-1, etc. */
+                total_tickets += (NR_SCHED_QUEUES - q);
             }
         }
     }
-    else
+
+    /* If no tickets, return NULL */
+    if (total_tickets == 0)
+        return NULL;
+
+    /* Draw a random ticket */
+    chosen_ticket = lottery_random() % total_tickets;
+
+    /* Second pass: find the process that owns the chosen ticket */
+    current_ticket = 0;
+    for (q = 0; q < NR_SCHED_QUEUES; q++)
     {
-        // No processes with tickets, use IDLE
-        rp = rdy_head[NR_SCHED_QUEUES - 1];
+        for (rp = rdy_head[q]; rp != NULL; rp = rp->p_nextready)
+        {
+            int process_tickets;
+            
+            if (q == IDLE_Q)
+            {
+                process_tickets = 1;
+            }
+            else
+            {
+                process_tickets = (NR_SCHED_QUEUES - q);
+            }
+
+            if (chosen_ticket < current_ticket + process_tickets)
+            {
+                /* This is the chosen process */
+                assert(proc_is_runnable(rp));
+                if (priv(rp)->s_flags & BILLABLE)
+                    get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+                return rp;
+            }
+            current_ticket += process_tickets;
+        }
     }
 
-    if (rp != NULL)
-    {
-        assert(proc_is_runnable(rp));
-        if (priv(rp)->s_flags & BILLABLE)
-            get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
-    }
-
-    return rp;
+    /* Should never reach here if total_tickets was calculated correctly */
+    return NULL;
 }
 
 /*===========================================================================*
