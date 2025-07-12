@@ -286,7 +286,9 @@ struct proc
 #define isrootsysn(n) ((n) == ROOT_SYS_PROC_NR)
 
 /* Define IDLE_Q as the last queue (highest priority number) */
+#ifndef IDLE_Q
 #define IDLE_Q (NR_SCHED_QUEUES - 1)
+#endif
 
 #ifndef __ASSEMBLY__
 
