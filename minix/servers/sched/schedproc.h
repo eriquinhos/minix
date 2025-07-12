@@ -18,30 +18,26 @@
 /**
  * We might later want to add more information to this table, such as the
  * process owner, process group or cpumask.
+ *
+ * For lottery scheduling, the priority field determines the number of tickets
+ * a process gets. Lower priority numbers get more tickets.
  */
 
-EXTERN struct schedproc {
-	endpoint_t endpoint;	/* process endpoint id */
-	endpoint_t parent;	/* parent endpoint id */
-	unsigned flags;		/* flag bits */
+EXTERN struct schedproc
+{
+    endpoint_t endpoint; /* process endpoint id */
+    endpoint_t parent;   /* parent endpoint id */
+    unsigned flags;      /* flag bits */
 
-	/* User space scheduling */
-	unsigned max_priority;	/* this process' highest allowed priority */
-	unsigned priority;		/* the process' current priority */
-	unsigned time_slice;		/* this process's time slice */
-	unsigned cpu;		/* what CPU is the process running on */
-	bitchunk_t cpu_mask[BITMAP_CHUNKS(CONFIG_MAX_CPUS)]; /* what CPUs is the
-								process allowed
-								to run on */
-	
-	/* Guaranteed Scheduling specific fields */
-	double cpu_share;		/* guaranteed CPU share (0.0 to 1.0) */
-	clock_t cpu_time_used;		/* total CPU time used by process */
-	clock_t start_time;		/* when process started */
-	double fairness_ratio;		/* current fairness ratio */
-	unsigned total_quanta;		/* total number of quanta received */
-	clock_t last_update;		/* last time statistics were updated */
+    /* User space scheduling */
+    unsigned max_priority;                               /* this process' highest allowed priority */
+    unsigned priority;                                   /* the process' current priority (determines lottery tickets) */
+    unsigned time_slice;                                 /* this process's time slice */
+    unsigned cpu;                                        /* what CPU is the process running on */
+    bitchunk_t cpu_mask[BITMAP_CHUNKS(CONFIG_MAX_CPUS)]; /* what CPUs is the
+                                process allowed
+                                to run on */
 } schedproc[NR_PROCS];
 
 /* Flag values */
-#define IN_USE		0x00001	/* set when 'schedproc' slot in use */
+#define IN_USE 0x00001 /* set when 'schedproc' slot in use */
