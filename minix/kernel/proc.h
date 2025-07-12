@@ -285,6 +285,9 @@ struct proc
 #define isusern(n) ((n) >= 0)
 #define isrootsysn(n) ((n) == ROOT_SYS_PROC_NR)
 
+/* Define IDLE_Q as the last queue (highest priority number) */
+#define IDLE_Q (NR_SCHED_QUEUES - 1)
+
 #ifndef __ASSEMBLY__
 
 EXTERN struct proc proc[NR_TASKS + NR_PROCS]; /* process table */
