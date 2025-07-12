@@ -100,17 +100,17 @@ int do_noquantum(message *m_ptr)
     }
 
     rmp = &schedproc[proc_nr_n];
-
-    /* Lottery scheduling: when a process runs out of quantum,
-     * we don't necessarily lower its priority. The lottery algorithm
-     * will naturally give processes with higher priority (lower numbers)
-     * more chances to be selected.
+    
+    /* Lottery scheduling: when a process runs out of quantum, 
+     * we may lower its priority slightly to prevent monopolization.
+     * However, the lottery algorithm will still give it chances
+     * proportional to its priority level.
      */
     if (rmp->priority < MIN_USER_Q)
     {
         /* Only lower priority for user processes that have been running
-         * for a while to prevent starvation */
-        rmp->priority += 1; /* lower priority */
+         * for a while to prevent starvation. This is a gentle degradation. */
+        rmp->priority += 1; /* lower priority (higher number) */
     }
 
     if ((rv = schedule_process_local(rmp)) != OK)
@@ -376,7 +376,7 @@ void init_scheduling(void)
  * scheduler bumps processes down one priority when ever they run out of
  * quantum. This function will find all proccesses that have been bumped down,
  * and pulls them back up. This default policy will soon be changed.
- *
+ * 
  * For lottery scheduling, we maintain the balance but the actual selection
  * is done probabilistically in the kernel's pick_proc() function.
  */
@@ -391,7 +391,7 @@ void balance_queues(void)
         {
             if (rmp->priority > rmp->max_priority)
             {
-                rmp->priority -= 1; /* increase priority */
+                rmp->priority -= 1; /* increase priority (lower number) */
                 schedule_process_local(rmp);
             }
         }
