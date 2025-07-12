@@ -101,18 +101,9 @@ int do_noquantum(message *m_ptr)
 
     rmp = &schedproc[proc_nr_n];
     
-    /* Lottery scheduling: when a process runs out of quantum, 
-     * we may lower its priority slightly to prevent monopolization.
-     * However, the lottery algorithm will still give it chances
-     * proportional to its priority level.
-     */
-    if (rmp->priority < MIN_USER_Q)
-    {
-        /* Only lower priority for user processes that have been running
-         * for a while to prevent starvation. This is a gentle degradation. */
-        rmp->priority += 1; /* lower priority (higher number) */
-    }
-
+    /* For lottery scheduling, we don't change priority on quantum expiration
+     * The lottery algorithm handles fairness through probabilistic selection */
+    
     if ((rv = schedule_process_local(rmp)) != OK)
     {
         return rv;
