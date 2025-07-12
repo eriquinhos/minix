@@ -1925,68 +1925,47 @@ static struct proc *pick_proc(void)
     register struct proc *rp; /* process to run */
     struct proc **rdy_head;
     int q; /* iterate over queues */
-    int total_tickets = 0;
-    int chosen_ticket;
-    int current_ticket = 0;
 
     rdy_head = get_cpulocal_var(run_q_head);
 
-    /* First pass: count total tickets from all ready processes */
+    /* Simple lottery implementation: try higher priority queues first with probability */
     for (q = 0; q < NR_SCHED_QUEUES; q++)
     {
-        for (rp = rdy_head[q]; rp != NULL; rp = rp->p_nextready)
+        if (rdy_head[q] != NULL)
         {
-            if (q == IDLE_Q)
+            /* Calculate probability based on priority */
+            int probability = (NR_SCHED_QUEUES - q) * 10; /* Higher priority = higher probability */
+            int random_val = lottery_random() % 100;
+            
+            if (random_val < probability || q == (NR_SCHED_QUEUES - 1))
             {
-                /* IDLE processes get 1 ticket */
-                total_tickets += 1;
-            }
-            else
-            {
-                /* Higher priority (lower number) gets more tickets */
-                /* Priority 0 gets NR_SCHED_QUEUES tickets, priority 1 gets NR_SCHED_QUEUES-1, etc. */
-                total_tickets += (NR_SCHED_QUEUES - q);
+                /* Select first process from this queue */
+                rp = rdy_head[q];
+                if (rp != NULL && proc_is_runnable(rp))
+                {
+                    if (priv(rp)->s_flags & BILLABLE)
+                        get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
+                    return rp;
+                }
             }
         }
     }
 
-    /* If no tickets, return NULL */
-    if (total_tickets == 0)
-        return NULL;
-
-    /* Draw a random ticket */
-    chosen_ticket = lottery_random() % total_tickets;
-
-    /* Second pass: find the process that owns the chosen ticket */
-    current_ticket = 0;
+    /* Fallback: return first available process */
     for (q = 0; q < NR_SCHED_QUEUES; q++)
     {
-        for (rp = rdy_head[q]; rp != NULL; rp = rp->p_nextready)
+        if (rdy_head[q] != NULL)
         {
-            int process_tickets;
-            
-            if (q == IDLE_Q)
+            rp = rdy_head[q];
+            if (proc_is_runnable(rp))
             {
-                process_tickets = 1;
-            }
-            else
-            {
-                process_tickets = (NR_SCHED_QUEUES - q);
-            }
-
-            if (chosen_ticket < current_ticket + process_tickets)
-            {
-                /* This is the chosen process */
-                assert(proc_is_runnable(rp));
                 if (priv(rp)->s_flags & BILLABLE)
                     get_cpulocal_var(bill_ptr) = rp; /* bill for system time */
                 return rp;
             }
-            current_ticket += process_tickets;
         }
     }
 
-    /* Should never reach here if total_tickets was calculated correctly */
     return NULL;
 }
 
