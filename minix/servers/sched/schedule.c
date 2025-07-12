@@ -1,4 +1,4 @@
-/* This file contains the scheduling policy for SCHED - Guaranteed Scheduling
+/* This file contains the scheduling policy for SCHED
  *
  * The entry points are:
  *   do_noquantum:        Called on behalf of process' that run out of quantum
@@ -12,185 +12,112 @@
 #include <assert.h>
 #include <minix/com.h>
 #include <machine/archtypes.h>
-#include <minix/sysutil.h>
-#include <minix/timers.h>
 
 static unsigned balance_timeout;
 
-#define BALANCE_TIMEOUT	5 /* how often to balance queues in seconds */
+#define BALANCE_TIMEOUT 5 /* how often to balance queues in seconds */
 
-static int schedule_process(struct schedproc * rmp, unsigned flags);
-static clock_t get_monotonic(void);
+static int schedule_process(struct schedproc *rmp, unsigned flags);
 
-#define SCHEDULE_CHANGE_PRIO	0x1
-#define SCHEDULE_CHANGE_QUANTUM	0x2
-#define SCHEDULE_CHANGE_CPU	0x4
+#define SCHEDULE_CHANGE_PRIO 0x1
+#define SCHEDULE_CHANGE_QUANTUM 0x2
+#define SCHEDULE_CHANGE_CPU 0x4
 
-#define SCHEDULE_CHANGE_ALL	(	\
-		SCHEDULE_CHANGE_PRIO	|	\
-		SCHEDULE_CHANGE_QUANTUM	|	\
-		SCHEDULE_CHANGE_CPU		\
-		)
+#define SCHEDULE_CHANGE_ALL ( \
+    SCHEDULE_CHANGE_PRIO |    \
+    SCHEDULE_CHANGE_QUANTUM | \
+    SCHEDULE_CHANGE_CPU)
 
-#define schedule_process_local(p)	\
-	schedule_process(p, SCHEDULE_CHANGE_PRIO | SCHEDULE_CHANGE_QUANTUM)
-#define schedule_process_migrate(p)	\
-	schedule_process(p, SCHEDULE_CHANGE_CPU)
+#define schedule_process_local(p) \
+    schedule_process(p, SCHEDULE_CHANGE_PRIO | SCHEDULE_CHANGE_QUANTUM)
+#define schedule_process_migrate(p) \
+    schedule_process(p, SCHEDULE_CHANGE_CPU)
 
-#define CPU_DEAD	-1
+#define CPU_DEAD -1
 
-#define cpu_is_available(c)	(cpu_proc[c] >= 0)
+#define cpu_is_available(c) (cpu_proc[c] >= 0)
 
 #define DEFAULT_USER_TIME_SLICE 200
 
 /* processes created by RS are sysytem processes */
-#define is_system_proc(p)	((p)->parent == RS_PROC_NR)
+#define is_system_proc(p) ((p)->parent == RS_PROC_NR)
 
 static unsigned cpu_proc[CONFIG_MAX_CPUS];
 
-/* Guaranteed Scheduling specific constants */
-#define DEFAULT_CPU_SHARE 1.0      /* Default CPU share (equal for all processes) */
-#define MIN_QUANTUM_MS 10          /* Minimum quantum in milliseconds */
-#define MAX_QUANTUM_MS 500         /* Maximum quantum in milliseconds */
-#define MIN_TIME_THRESHOLD 1       /* Minimum time threshold to avoid division by zero */
-
-static void pick_cpu(struct schedproc * proc)
+static void pick_cpu(struct schedproc *proc)
 {
 #ifdef CONFIG_SMP
-	unsigned cpu, c;
-	unsigned cpu_load = (unsigned) -1;
-	
-	if (machine.processors_count == 1) {
-		proc->cpu = machine.bsp_id;
-		return;
-	}
+    unsigned cpu, c;
+    unsigned cpu_load = (unsigned)-1;
 
-	/* schedule sysytem processes only on the boot cpu */
-	if (is_system_proc(proc)) {
-		proc->cpu = machine.bsp_id;
-		return;
-	}
+    if (machine.processors_count == 1)
+    {
+        proc->cpu = machine.bsp_id;
+        return;
+    }
 
-	/* if no other cpu available, try BSP */
-	cpu = machine.bsp_id;
-	for (c = 0; c < machine.processors_count; c++) {
-		/* skip dead cpus */
-		if (!cpu_is_available(c))
-			continue;
-		if (c != machine.bsp_id && cpu_load > cpu_proc[c]) {
-			cpu_load = cpu_proc[c];
-			cpu = c;
-		}
-	}
-	proc->cpu = cpu;
-	cpu_proc[cpu]++;
+    /* schedule sysytem processes only on the boot cpu */
+    if (is_system_proc(proc))
+    {
+        proc->cpu = machine.bsp_id;
+        return;
+    }
+
+    /* if no other cpu available, try BSP */
+    cpu = machine.bsp_id;
+    for (c = 0; c < machine.processors_count; c++)
+    {
+        /* skip dead cpus */
+        if (!cpu_is_available(c))
+            continue;
+        if (c != machine.bsp_id && cpu_load > cpu_proc[c])
+        {
+            cpu_load = cpu_proc[c];
+            cpu = c;
+        }
+    }
+    proc->cpu = cpu;
+    cpu_proc[cpu]++;
 #else
-	proc->cpu = 0;
+    proc->cpu = 0;
 #endif
-}
-
-/*===========================================================================*
- *				calculate_fairness_ratio		     *
- *===========================================================================*/
-static double calculate_fairness_ratio(struct schedproc *rmp)
-{
-	/* Calculate fairness ratio for guaranteed scheduling:
-	 * ratio = (actual_cpu_time / total_time) / cpu_share
-	 * Lower ratio means process deserves more CPU time
-	 */
-	clock_t current_time = get_monotonic();
-	clock_t total_time = current_time - rmp->start_time;
-	
-	/* FIXED: Add safety checks to prevent division by zero */
-	if (total_time <= MIN_TIME_THRESHOLD || rmp->cpu_share <= 0.0) {
-		return 1.0; /* Default ratio */
-	}
-	
-	/* FIXED: Additional check for cpu_time_used */
-	if (rmp->cpu_time_used <= 0) {
-		return 0.1; /* Process hasn't used much CPU, give it priority */
-	}
-	
-	double actual_ratio = (double)rmp->cpu_time_used / (double)total_time;
-	double fairness_ratio = actual_ratio / rmp->cpu_share;
-	
-	/* FIXED: Ensure fairness_ratio is within reasonable bounds */
-	if (fairness_ratio < 0.01) {
-		fairness_ratio = 0.01;
-	} else if (fairness_ratio > 100.0) {
-		fairness_ratio = 100.0;
-	}
-	
-	return fairness_ratio;
-}
-
-/*===========================================================================*
- *				update_cpu_usage			     *
- *===========================================================================*/
-static void update_cpu_usage(struct schedproc *rmp, unsigned time_used)
-{
-	/* Update CPU usage statistics for guaranteed scheduling */
-	rmp->cpu_time_used += time_used;
-	rmp->total_quanta++;
-	
-	/* Update fairness ratio */
-	rmp->fairness_ratio = calculate_fairness_ratio(rmp);
 }
 
 /*===========================================================================*
  *				do_noquantum				     *
  *===========================================================================*/
+
 int do_noquantum(message *m_ptr)
 {
-	register struct schedproc *rmp;
-	int rv, proc_nr_n;
-	unsigned quantum_used;
+    register struct schedproc *rmp;
+    int rv, proc_nr_n;
 
-	if (sched_isokendpt(m_ptr->m_source, &proc_nr_n) != OK) {
-		printf("SCHED: WARNING: got an invalid endpoint in OOQ msg %u.\n",
-		m_ptr->m_source);
-		return EBADEPT;
-	}
+    if (sched_isokendpt(m_ptr->m_source, &proc_nr_n) != OK)
+    {
+        printf("SCHED: WARNING: got an invalid endpoint in OOQ msg %u.\n",
+               m_ptr->m_source);
+        return EBADEPT;
+    }
 
-	rmp = &schedproc[proc_nr_n];
-	
-	/* Calculate how much of the quantum was actually used */
-	quantum_used = rmp->time_slice; /* Assume full quantum was used */
-	
-	/* Update CPU usage statistics */
-	update_cpu_usage(rmp, quantum_used);
-	
-	/* FIXED: Add safety checks before division operations */
-	/* For Guaranteed Scheduling, adjust quantum based on fairness */
-	/* Processes with lower fairness ratio get larger quantum */
-	if (rmp->fairness_ratio < 1.0 && rmp->fairness_ratio > 0.0) {
-		/* Process is behind, give it more time */
-		rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE * (2.0 - rmp->fairness_ratio));
-		if (rmp->time_slice > MAX_QUANTUM_MS) {
-			rmp->time_slice = MAX_QUANTUM_MS;
-		}
-	} else if (rmp->fairness_ratio >= 1.0) {
-		/* Process is ahead or on schedule, give normal or reduced time */
-		/* FIXED: Ensure fairness_ratio is not zero before division */
-		if (rmp->fairness_ratio > 0.01) {
-			rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
-		} else {
-			rmp->time_slice = DEFAULT_USER_TIME_SLICE;
-		}
-		
-		if (rmp->time_slice < MIN_QUANTUM_MS) {
-			rmp->time_slice = MIN_QUANTUM_MS;
-		}
-	} else {
-		/* Fallback case */
-		rmp->time_slice = DEFAULT_USER_TIME_SLICE;
-	}
-	
-	/* Don't change priority - guaranteed scheduling uses fairness ordering in kernel */
-	if ((rv = schedule_process_local(rmp)) != OK) {
-		return rv;
-	}
-	return OK;
+    rmp = &schedproc[proc_nr_n];
+
+    /* Lottery scheduling: when a process runs out of quantum,
+     * we don't necessarily lower its priority. The lottery algorithm
+     * will naturally give processes with higher priority (lower numbers)
+     * more chances to be selected.
+     */
+    if (rmp->priority < MIN_USER_Q)
+    {
+        /* Only lower priority for user processes that have been running
+         * for a while to prevent starvation */
+        rmp->priority += 1; /* lower priority */
+    }
+
+    if ((rv = schedule_process_local(rmp)) != OK)
+    {
+        return rv;
+    }
+    return OK;
 }
 
 /*===========================================================================*
@@ -198,27 +125,29 @@ int do_noquantum(message *m_ptr)
  *===========================================================================*/
 int do_stop_scheduling(message *m_ptr)
 {
-	register struct schedproc *rmp;
-	int proc_nr_n;
+    register struct schedproc *rmp;
+    int proc_nr_n;
 
-	/* check who can send you requests */
-	if (!accept_message(m_ptr))
-		return EPERM;
+    /* check who can send you requests */
+    if (!accept_message(m_ptr))
+        return EPERM;
 
-	if (sched_isokendpt(m_ptr->m_lsys_sched_scheduling_stop.endpoint,
-		    &proc_nr_n) != OK) {
-		printf("SCHED: WARNING: got an invalid endpoint in OoQ msg "
-		"%d\n", m_ptr->m_lsys_sched_scheduling_stop.endpoint);
-		return EBADEPT;
-	}
+    if (sched_isokendpt(m_ptr->m_lsys_sched_scheduling_stop.endpoint,
+                        &proc_nr_n) != OK)
+    {
+        printf("SCHED: WARNING: got an invalid endpoint in OOQ msg "
+               "%d\n",
+               m_ptr->m_lsys_sched_scheduling_stop.endpoint);
+        return EBADEPT;
+    }
 
-	rmp = &schedproc[proc_nr_n];
+    rmp = &schedproc[proc_nr_n];
 #ifdef CONFIG_SMP
-	cpu_proc[rmp->cpu]--;
+    cpu_proc[rmp->cpu]--;
 #endif
-	rmp->flags = 0; /*&= ~IN_USE;*/
+    rmp->flags = 0; /*&= ~IN_USE;*/
 
-	return OK;
+    return OK;
 }
 
 /*===========================================================================*
@@ -226,144 +155,120 @@ int do_stop_scheduling(message *m_ptr)
  *===========================================================================*/
 int do_start_scheduling(message *m_ptr)
 {
-	register struct schedproc *rmp;
-	int rv, proc_nr_n, parent_nr_n;
-	
-	/* we can handle two kinds of messages here */
-	assert(m_ptr->m_type == SCHEDULING_START || 
-		m_ptr->m_type == SCHEDULING_INHERIT);
+    register struct schedproc *rmp;
+    int rv, proc_nr_n, parent_nr_n;
 
-	/* check who can send you requests */
-	if (!accept_message(m_ptr))
-		return EPERM;
+    /* we can handle two kinds of messages here */
+    assert(m_ptr->m_type == SCHEDULING_START ||
+           m_ptr->m_type == SCHEDULING_INHERIT);
 
-	/* Resolve endpoint to proc slot. */
-	if ((rv = sched_isemtyendpt(m_ptr->m_lsys_sched_scheduling_start.endpoint,
-			&proc_nr_n)) != OK) {
-		return rv;
-	}
-	rmp = &schedproc[proc_nr_n];
+    /* check who can send you requests */
+    if (!accept_message(m_ptr))
+        return EPERM;
 
-	/* Populate process slot */
-	rmp->endpoint     = m_ptr->m_lsys_sched_scheduling_start.endpoint;
-	rmp->parent       = m_ptr->m_lsys_sched_scheduling_start.parent;
-	rmp->max_priority = m_ptr->m_lsys_sched_scheduling_start.maxprio;
-	if (rmp->max_priority >= NR_SCHED_QUEUES) {
-		return EINVAL;
-	}
+    /* Resolve endpoint to proc slot. */
+    if ((rv = sched_isemtyendpt(m_ptr->m_lsys_sched_scheduling_start.endpoint,
+                                &proc_nr_n)) != OK)
+    {
+        return rv;
+    }
+    rmp = &schedproc[proc_nr_n];
 
-	/* FIXED: Initialize Guaranteed Scheduling specific fields with safe values */
-	rmp->cpu_share = DEFAULT_CPU_SHARE;
-	rmp->cpu_time_used = 0;
-	rmp->start_time = get_monotonic();
-	/* FIXED: Ensure start_time is valid */
-	if (rmp->start_time <= 0) {
-		rmp->start_time = 1; /* Minimum valid time */
-	}
-	rmp->fairness_ratio = 1.0;
-	rmp->total_quanta = 0;
+    /* Populate process slot */
+    rmp->endpoint = m_ptr->m_lsys_sched_scheduling_start.endpoint;
+    rmp->parent = m_ptr->m_lsys_sched_scheduling_start.parent;
+    rmp->max_priority = m_ptr->m_lsys_sched_scheduling_start.maxprio;
+    if (rmp->max_priority >= NR_SCHED_QUEUES)
+    {
+        return EINVAL;
+    }
 
-	/* Inherit current priority and time slice from parent. Since there
-	 * is currently only one scheduler scheduling the whole system, this
-	 * value is local and we assert that the parent endpoint is valid */
-	if (rmp->endpoint == rmp->parent) {
-		/* We have a special case here for init, which is the first
-		   process scheduled, and the parent of itself. */
-		rmp->priority   = USER_Q;
-		rmp->time_slice = DEFAULT_USER_TIME_SLICE;
+    /* Inherit current priority and time slice from parent. Since there
+     * is currently only one scheduler scheduling the whole system, this
+     * value is local and we assert that the parent endpoint is valid */
+    if (rmp->endpoint == rmp->parent)
+    {
+        /* We have a special case here for init, which is the first
+           process scheduled, and the parent of itself. */
+        rmp->priority = USER_Q;
+        rmp->time_slice = DEFAULT_USER_TIME_SLICE;
 
-		/*
-		 * Since kernel never changes the cpu of a process, all are
-		 * started on the BSP and the userspace scheduling hasn't
-		 * changed that yet either, we can be sure that BSP is the
-		 * processor where the processes run now.
-		 */
+        /*
+         * Since kernel never changes the cpu of a process, all are
+         * started on the BSP and the userspace scheduling hasn't
+         * changed that yet either, we can be sure that BSP is the
+         * processor where the processes run now.
+         */
 #ifdef CONFIG_SMP
-		rmp->cpu = machine.bsp_id;
-		/* FIXME set the cpu mask */
+        rmp->cpu = machine.bsp_id;
+        /* FIXME set the cpu mask */
 #endif
-	}
-	
-	switch (m_ptr->m_type) {
+    }
 
-	case SCHEDULING_START:
-		/* We have a special case here for system processes, for which
-		 * quanum and priority are set explicitly rather than inherited 
-		 * from the parent */
-		rmp->priority   = rmp->max_priority;
-		rmp->time_slice = m_ptr->m_lsys_sched_scheduling_start.quantum;
-		/* FIXED: Ensure quantum is within valid range */
-		if (rmp->time_slice < MIN_QUANTUM_MS) {
-			rmp->time_slice = MIN_QUANTUM_MS;
-		} else if (rmp->time_slice > MAX_QUANTUM_MS) {
-			rmp->time_slice = MAX_QUANTUM_MS;
-		}
-		break;
-		
-	case SCHEDULING_INHERIT:
-		/* Inherit current priority and time slice from parent. Since there
-		 * is currently only one scheduler scheduling the whole system, this
-		 * value is local and we assert that the parent endpoint is valid */
-		if ((rv = sched_isokendpt(m_ptr->m_lsys_sched_scheduling_start.parent,
-				&parent_nr_n)) != OK)
-			return rv;
+    switch (m_ptr->m_type)
+    {
 
-		rmp->priority = schedproc[parent_nr_n].priority;
-		rmp->time_slice = schedproc[parent_nr_n].time_slice;
-		
-		/* FIXED: Ensure inherited values are valid */
-		if (rmp->time_slice < MIN_QUANTUM_MS) {
-			rmp->time_slice = MIN_QUANTUM_MS;
-		} else if (rmp->time_slice > MAX_QUANTUM_MS) {
-			rmp->time_slice = MAX_QUANTUM_MS;
-		}
-		
-		/* Inherit Guaranteed Scheduling parameters from parent */
-		rmp->cpu_share = schedproc[parent_nr_n].cpu_share;
-		/* FIXED: Ensure cpu_share is valid */
-		if (rmp->cpu_share <= 0.0) {
-			rmp->cpu_share = DEFAULT_CPU_SHARE;
-		}
-		break;
-		
-	default: 
-		/* not reachable */
-		assert(0);
-	}
+    case SCHEDULING_START:
+        /* We have a special case here for system processes, for which
+         * quanum and priority are set explicitly rather than inherited
+         * from the parent */
+        rmp->priority = rmp->max_priority;
+        rmp->time_slice = m_ptr->m_lsys_sched_scheduling_start.quantum;
+        break;
 
-	/* Take over scheduling the process. The kernel reply message populates
-	 * the processes current priority and its time slice */
-	if ((rv = sys_schedctl(0, rmp->endpoint, 0, 0, 0)) != OK) {
-		printf("Sched: Error taking over scheduling for %d, kernel said %d\n",
-			rmp->endpoint, rv);
-		return rv;
-	}
-	rmp->flags = IN_USE;
+    case SCHEDULING_INHERIT:
+        /* Inherit current priority and time slice from parent. Since there
+         * is currently only one scheduler scheduling the whole system, this
+         * value is local and we assert that the parent endpoint is valid */
+        if ((rv = sched_isokendpt(m_ptr->m_lsys_sched_scheduling_start.parent,
+                                  &parent_nr_n)) != OK)
+            return rv;
 
-	/* Schedule the process, giving it some quantum */
-	pick_cpu(rmp);
-	while ((rv = schedule_process(rmp, SCHEDULE_CHANGE_ALL)) == EBADCPU) {
-		/* don't try this CPU ever again */
-		cpu_proc[rmp->cpu] = CPU_DEAD;
-		pick_cpu(rmp);
-	}
+        rmp->priority = schedproc[parent_nr_n].priority;
+        rmp->time_slice = schedproc[parent_nr_n].time_slice;
+        break;
 
-	if (rv != OK) {
-		printf("Sched: Error while scheduling process, kernel replied %d\n",
-			rv);
-		return rv;
-	}
+    default:
+        /* not reachable */
+        assert(0);
+    }
 
-	/* Mark ourselves as the new scheduler.
-	 * By default, processes are scheduled by the parents scheduler. In case
-	 * this scheduler would want to delegate scheduling to another
-	 * scheduler, it could do so and then write the endpoint of that
-	 * scheduler into the "scheduler" field.
-	 */
+    /* Take over scheduling the process. The kernel reply message populates
+     * the processes current priority and its time slice */
+    if ((rv = sys_schedctl(0, rmp->endpoint, 0, 0, 0)) != OK)
+    {
+        printf("Sched: Error taking over scheduling for %d, kernel said %d\n",
+               rmp->endpoint, rv);
+        return rv;
+    }
+    rmp->flags = IN_USE;
 
-	m_ptr->m_sched_lsys_scheduling_start.scheduler = SCHED_PROC_NR;
+    /* Schedule the process, giving it some quantum */
+    pick_cpu(rmp);
+    while ((rv = schedule_process(rmp, SCHEDULE_CHANGE_ALL)) == EBADCPU)
+    {
+        /* don't try this CPU ever again */
+        cpu_proc[rmp->cpu] = CPU_DEAD;
+        pick_cpu(rmp);
+    }
 
-	return OK;
+    if (rv != OK)
+    {
+        printf("Sched: Error while scheduling process, kernel replied %d\n",
+               rv);
+        return rv;
+    }
+
+    /* Mark ourselves as the new scheduler.
+     * By default, processes are scheduled by the parents scheduler. In case
+     * this scheduler would want to delegate scheduling to another
+     * scheduler, it could do so and then write the endpoint of that
+     * scheduler into the "scheduler" field.
+     */
+
+    m_ptr->m_sched_lsys_scheduling_start.scheduler = SCHED_PROC_NR;
+
+    return OK;
 }
 
 /*===========================================================================*
@@ -371,98 +276,83 @@ int do_start_scheduling(message *m_ptr)
  *===========================================================================*/
 int do_nice(message *m_ptr)
 {
-	struct schedproc *rmp;
-	int rv;
-	int proc_nr_n;
-	unsigned new_q, old_q, old_max_q;
+    struct schedproc *rmp;
+    int rv;
+    int proc_nr_n;
+    unsigned new_q, old_q, old_max_q;
 
-	/* check who can send you requests */
-	if (!accept_message(m_ptr))
-		return EPERM;
+    /* check who can send you requests */
+    if (!accept_message(m_ptr))
+        return EPERM;
 
-	if (sched_isokendpt(m_ptr->m_pm_sched_scheduling_set_nice.endpoint, &proc_nr_n) != OK) {
-		printf("SCHED: WARNING: got an invalid endpoint in OoQ msg "
-		"%d\n", m_ptr->m_pm_sched_scheduling_set_nice.endpoint);
-		return EBADEPT;
-	}
+    if (sched_isokendpt(m_ptr->m_pm_sched_scheduling_set_nice.endpoint, &proc_nr_n) != OK)
+    {
+        printf("SCHED: WARNING: got an invalid endpoint in OoQ msg "
+               "%d\n",
+               m_ptr->m_pm_sched_scheduling_set_nice.endpoint);
+        return EBADEPT;
+    }
 
-	rmp = &schedproc[proc_nr_n];
-	new_q = m_ptr->m_pm_sched_scheduling_set_nice.maxprio;
-	if (new_q >= NR_SCHED_QUEUES) {
-		return EINVAL;
-	}
+    rmp = &schedproc[proc_nr_n];
+    new_q = m_ptr->m_pm_sched_scheduling_set_nice.maxprio;
+    if (new_q >= NR_SCHED_QUEUES)
+    {
+        return EINVAL;
+    }
 
-	/* Store old values, in case we need to roll back the changes */
-	old_q     = rmp->priority;
-	old_max_q = rmp->max_priority;
+    /* Store old values, in case we need to roll back the changes */
+    old_q = rmp->priority;
+    old_max_q = rmp->max_priority;
 
-	/* Update the proc entry and reschedule the process */
-	rmp->max_priority = rmp->priority = new_q;
-	
-	/* FIXED: Adjust CPU share based on nice level for guaranteed scheduling */
-	/* Higher priority (lower number) gets more CPU share */
-	if (NR_SCHED_QUEUES > 0) {
-		rmp->cpu_share = DEFAULT_CPU_SHARE * (NR_SCHED_QUEUES - new_q) / NR_SCHED_QUEUES;
-		if (rmp->cpu_share < 0.1) {
-			rmp->cpu_share = 0.1; /* Minimum share */
-		}
-	} else {
-		rmp->cpu_share = DEFAULT_CPU_SHARE;
-	}
+    /* Update the proc entry and reschedule the process */
+    rmp->max_priority = rmp->priority = new_q;
 
-	if ((rv = schedule_process_local(rmp)) != OK) {
-		/* Something went wrong when rescheduling the process, roll
-		 * back the changes to proc struct */
-		rmp->priority     = old_q;
-		rmp->max_priority = old_max_q;
-		rmp->cpu_share = DEFAULT_CPU_SHARE;
-	}
+    if ((rv = schedule_process_local(rmp)) != OK)
+    {
+        /* Something went wrong when rescheduling the process, roll
+         * back the changes to proc struct */
+        rmp->priority = old_q;
+        rmp->max_priority = old_max_q;
+    }
 
-	return rv;
+    return rv;
 }
 
 /*===========================================================================*
  *				schedule_process			     *
  *===========================================================================*/
-static int schedule_process(struct schedproc * rmp, unsigned flags)
+static int schedule_process(struct schedproc *rmp, unsigned flags)
 {
-	int err;
-	int new_prio, new_quantum, new_cpu, niced;
+    int err;
+    int new_prio, new_quantum, new_cpu, niced;
 
-	pick_cpu(rmp);
+    pick_cpu(rmp);
 
-	if (flags & SCHEDULE_CHANGE_PRIO)
-		new_prio = rmp->priority;
-	else
-		new_prio = -1;
+    if (flags & SCHEDULE_CHANGE_PRIO)
+        new_prio = rmp->priority;
+    else
+        new_prio = -1;
 
-	if (flags & SCHEDULE_CHANGE_QUANTUM) {
-		/* For Guaranteed Scheduling, quantum is dynamically adjusted */
-		new_quantum = rmp->time_slice;
-		/* FIXED: Ensure quantum is within valid bounds */
-		if (new_quantum < MIN_QUANTUM_MS) {
-			new_quantum = MIN_QUANTUM_MS;
-		} else if (new_quantum > MAX_QUANTUM_MS) {
-			new_quantum = MAX_QUANTUM_MS;
-		}
-	} else {
-		new_quantum = -1;
-	}
+    if (flags & SCHEDULE_CHANGE_QUANTUM)
+        new_quantum = rmp->time_slice;
+    else
+        new_quantum = -1;
 
-	if (flags & SCHEDULE_CHANGE_CPU)
-		new_cpu = rmp->cpu;
-	else
-		new_cpu = -1;
+    if (flags & SCHEDULE_CHANGE_CPU)
+        new_cpu = rmp->cpu;
+    else
+        new_cpu = -1;
 
-	niced = (rmp->max_priority > USER_Q);
+    niced = (rmp->max_priority > USER_Q);
 
-	if ((err = sys_schedule(rmp->endpoint, new_prio,
-		new_quantum, new_cpu, niced)) != OK) {
-		printf("PM: An error occurred when trying to schedule %d: %d\n",
-		rmp->endpoint, err);
-	}
+    if ((err = sys_schedule(rmp->endpoint, new_prio,
+                            new_quantum, new_cpu, niced)) != OK)
+    {
+        printf("PM: An error occurred when trying to schedule %d: %d\n",
+               rmp->endpoint, err);
+    }
 
-	return err;
+    return err;
 }
 
 /*===========================================================================*
@@ -470,66 +360,43 @@ static int schedule_process(struct schedproc * rmp, unsigned flags)
  *===========================================================================*/
 void init_scheduling(void)
 {
-	int r;
+    int r;
 
-	balance_timeout = BALANCE_TIMEOUT * sys_hz();
+    balance_timeout = BALANCE_TIMEOUT * sys_hz();
 
-	if ((r = sys_setalarm(balance_timeout, 0)) != OK)
-		panic("sys_setalarm failed: %d", r);
+    if ((r = sys_setalarm(balance_timeout, 0)) != OK)
+        panic("sys_setalarm failed: %d", r);
 }
 
 /*===========================================================================*
  *				balance_queues				     *
  *===========================================================================*/
 
-/* This function is called every N ticks to rebalance the queues. 
- * For Guaranteed Scheduling, we update fairness ratios and adjust CPU shares.
+/* This function in called every N ticks to rebalance the queues. The current
+ * scheduler bumps processes down one priority when ever they run out of
+ * quantum. This function will find all proccesses that have been bumped down,
+ * and pulls them back up. This default policy will soon be changed.
+ *
+ * For lottery scheduling, we maintain the balance but the actual selection
+ * is done probabilistically in the kernel's pick_proc() function.
  */
 void balance_queues(void)
 {
-	struct schedproc *rmp;
-	int r, proc_nr;
-	clock_t current_time = get_monotonic();
+    struct schedproc *rmp;
+    int r, proc_nr;
 
-	for (proc_nr=0, rmp=schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++) {
-		if (rmp->flags & IN_USE) {
-			/* Update fairness ratio */
-			rmp->fairness_ratio = calculate_fairness_ratio(rmp);
-			
-			/* FIXED: Adjust time slice based on fairness with safety checks */
-			if (rmp->fairness_ratio < 0.5 && rmp->fairness_ratio > 0.0) {
-				/* Process is significantly behind, boost it */
-				rmp->time_slice = MAX_QUANTUM_MS;
-			} else if (rmp->fairness_ratio > 2.0) {
-				/* Process is significantly ahead, reduce it */
-				rmp->time_slice = MIN_QUANTUM_MS;
-			} else if (rmp->fairness_ratio > 0.01) {
-				/* Normal adjustment with division safety check */
-				rmp->time_slice = (unsigned)(DEFAULT_USER_TIME_SLICE / rmp->fairness_ratio);
-				if (rmp->time_slice < MIN_QUANTUM_MS) {
-					rmp->time_slice = MIN_QUANTUM_MS;
-				} else if (rmp->time_slice > MAX_QUANTUM_MS) {
-					rmp->time_slice = MAX_QUANTUM_MS;
-				}
-			} else {
-				/* Fallback for invalid fairness_ratio */
-				rmp->time_slice = DEFAULT_USER_TIME_SLICE;
-			}
-			
-			/* Reschedule to update kernel with new quantum */
-			schedule_process_local(rmp);
-		}
-	}
+    for (proc_nr = 0, rmp = schedproc; proc_nr < NR_PROCS; proc_nr++, rmp++)
+    {
+        if (rmp->flags & IN_USE)
+        {
+            if (rmp->priority > rmp->max_priority)
+            {
+                rmp->priority -= 1; /* increase priority */
+                schedule_process_local(rmp);
+            }
+        }
+    }
 
-	if ((r = sys_setalarm(balance_timeout, 0)) != OK)
-		panic("sys_setalarm failed: %d", r);
-}
-
-static clock_t get_monotonic(void)
-{
-	clock_t uptime;
-	if (sys_times(NONE, &uptime, NULL, NULL, NULL) != OK) {
-		uptime = 1; /* FIXED: Return 1 instead of 0 to avoid division by zero */
-	}
-	return uptime > 0 ? uptime : 1; /* FIXED: Ensure positive return value */
+    if ((r = sys_setalarm(balance_timeout, 0)) != OK)
+        panic("sys_setalarm failed: %d", r);
 }
